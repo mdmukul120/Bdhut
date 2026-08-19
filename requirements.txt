@@ -1,2 +1,2 @@
-playwright==1.41.2
-pydantic==2.6.0
+playwright
+pydantic
