@@ -6,143 +6,122 @@ from datetime import datetime
 from typing import Set, List, Dict, Any
 from playwright.async_api import async_playwright, Page, BrowserContext
 
-# লগিং কনফিগারেশন
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-class AdvancedStreamScraper:
-    def __init__(self, target_urls: List[str]):
-        self.target_urls = target_urls
+class FootfyTVScraper:
+    def __init__(self, base_url: str):
+        self.base_url = base_url
         self.extracted_data: List[Dict[str, Any]] = []
 
     async def _configure_context(self, browser) -> BrowserContext:
-        """ব্রাউজার কনটেক্সট এবং রিয়েলিস্টিক ইউজার-এজেন্ট সেটআপ"""
         return await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080},
-            device_scale_factor=1,
-            is_mobile=False,
-            has_touch=False,
-            locale="en-US",
-            timezone_id="UTC"
+            locale="en-US"
         )
 
-    async def _block_ads_and_trackers(self, route):
-        """অ্যাডের ডোমেইন ও ইমেজ/ফন্ট ব্লক করে স্পিড বাড়ানোর ফাংশন"""
-        excluded_resources = ["image", "stylesheet", "font", "media"]
+    async def _block_ads(self, route):
+        excluded_resources = ["image", "stylesheet", "font"]
         blocked_domains = ["google-analytics", "doubleclick", "popads", "popcash", "adsterra", "exoclick"]
         
-        request_url = route.request.url
+        url = route.request.url
         resource_type = route.request.resource_type
 
-        if resource_type in excluded_resources or any(domain in request_url for domain in blocked_domains):
+        if resource_type in excluded_resources or any(domain in url for domain in blocked_domains):
             await route.abort()
         else:
             await route.continue_()
 
-    def _is_valid_stream_link(self, url: str) -> bool:
-        """ভিডিও ও স্ট্রিমিং ইউআরএল যাচাই করার ফিল্টার"""
-        patterns = [r"\.m3u8", r"\.mpd", r"/embed/", r"/player/", r"stream", r"live"]
-        ignored_patterns = [r"analytics", r"facebook", r"twitter", r"captcha", r"ad-provider"]
-        
-        is_matched = any(re.search(p, url, re.IGNORECASE) for p in patterns)
-        is_ignored = any(re.search(p, url, re.IGNORECASE) for p in ignored_patterns)
-        
-        return is_matched and not is_ignored
+    def _is_stream_link(self, url: str) -> bool:
+        patterns = [r"\.m3u8", r"\.mpd", r"/embed/", r"/player/", r"stream", r"watch"]
+        ignored = [r"analytics", r"facebook", r"twitter", r"google"]
+        return any(re.search(p, url, re.IGNORECASE) for p in patterns) and not any(re.search(i, url, re.IGNORECASE) for i in ignored)
 
-    async def _handle_network_requests(self, page: Page, captured_links: Set[str]):
-        """নেটওয়ার্ক ট্রাফিক থেকে ডাইনামিক লিংক এক্সট্র্যাক্ট করা"""
+    async def get_all_match_links(self, page: Page) -> List[str]:
+        """হোমপেজ থেকে সকল লাইভ ও স্পোর্টস ম্যাচের লিংক সংগ্রহ করা"""
+        logging.info("Fetching all match links from home page...")
+        await page.goto(self.base_url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(3000)
+
+        # /watch/ বা ম্যাচ আইডিযুক্ত লিংক ক্রল করা
+        links = await page.eval_on_selector_all("a[href*='/watch/']", "elements => elements.map(el => el.href)")
+        unique_matches = list(set(links))
+        logging.info(f"Found {len(unique_matches)} matches on homepage.")
+        return unique_matches
+
+    async def scrape_match_player(self, context: BrowserContext, match_url: str) -> Dict[str, Any]:
+        """প্রতিটি ম্যাচের ভেতরে গিয়ে মূল স্ট্রিমিং ও প্লেয়ার লিংক ধরা"""
+        page = await context.new_page()
+        player_links: Set[str] = set()
+
+        await page.route("**/*", self._block_ads)
+
         def on_request(request):
-            url = request.url
-            if self._is_valid_stream_link(url):
-                captured_links.add(url)
+            if self._is_stream_link(request.url):
+                player_links.add(request.url)
 
         page.on("request", on_request)
 
-    async def _trigger_dynamic_elements(self, page: Page):
-        """প্লেয়ার বোতাম, সার্ভার সুইচিং ট্যাব এবং ড্রপডাউনে অটো-ক্লিক করার ফাংশন"""
+        logging.info(f"Scraping player links from: {match_url}")
         try:
-            # পেজের অ্যাড পপ-আপ রিমুভ করা
-            await page.evaluate("""() => {
-                const ads = document.querySelectorAll('div[id*="ad"], div[class*="ad"], iframe[src*="ad"]');
-                ads.forEach(ad => ad.remove());
-            }""")
-            
-            # সার্ভার পরিবর্তনের বোতাম থাকলে ক্লিক করা
-            server_buttons = await page.query_selector_all("button:has-text('Server'), a:has-text('Server'), .server-btn")
-            for btn in server_buttons[:5]: # প্রথম ৫টি সার্ভার ট্রাই করবে
-                if await btn.is_visible():
-                    await btn.click(force=True)
-                    await page.wait_for_timeout(1500)
-        except Exception as e:
-            logging.warning(f"Error clicking dynamic elements: {e}")
-
-    async def scrape_single_url(self, context: BrowserContext, url: str) -> Dict[str, Any]:
-        """এক একক পেজ স্ক্র্যাপ করার মূল প্রসেস"""
-        page = await context.new_page()
-        captured_links: Set[str] = set()
-
-        # রাউটিং অ্যাড-ব্লক অ্যাক্টিভেশন
-        await page.route("**/*", self._block_ads_and_trackers)
-        await self._handle_network_requests(page, captured_links)
-
-        logging.info(f"Navigating to: {url}")
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            await page.goto(match_url, wait_until="domcontentloaded", timeout=45000)
             await page.wait_for_timeout(3000)
 
-            # ডাইনামিক ক্লিক ও ইন্টারঅ্যাকশন
-            await self._trigger_dynamic_elements(page)
+            # iframe সোর্স চেক করা
+            iframes = await page.eval_on_selector_all("iframe", "iframes => iframes.map(i => i.src)")
+            for src in iframes:
+                if src and src.startswith("http") and self._is_stream_link(src):
+                    player_links.add(src)
 
-            # HTML-এ থাকা সমস্ত iframe src উদ্ধার
-            iframe_sources = await page.eval_on_selector_all("iframe", "iframes => iframes.map(i => i.src)")
-            for src in iframe_sources:
-                if src and src.startswith("http") and self._is_valid_stream_link(src):
-                    captured_links.add(src)
+            # সার্ভার বাটনে অটো-ক্লিক করে নতুন ড্রাইভ/প্লেয়ার লোড করা
+            servers = await page.query_selector_all("button:has-text('Server'), .server-btn, a[data-url]")
+            for btn in servers[:4]:
+                if await btn.is_visible():
+                    await btn.click(force=True)
+                    await page.wait_for_timeout(1000)
 
         except Exception as e:
-            logging.error(f"Failed to scrape {url}: {e}")
+            logging.error(f"Failed to extract from {match_url}: {e}")
         finally:
             await page.close()
 
         return {
-            "page_url": url,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "total_found": len(captured_links),
-            "stream_links": list(captured_links)
+            "match_url": match_url,
+            "total_players_found": len(player_links),
+            "player_links": list(player_links)
         }
 
-    async def run_pipeline(self):
-        """মাল্টি-ইউআরএল মেথড চালনা করার মেন ফাংশন"""
+    async def run(self):
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-web-security"]
-            )
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
             context = await self._configure_context(browser)
 
-            tasks = [self.scrape_single_url(context, url) for url in self.target_urls]
-            self.extracted_data = await asyncio.gather(*tasks)
+            # ১. হোমপেজের এক্সেস নেওয়া
+            main_page = await context.new_page()
+            await main_page.route("**/*", self._block_ads)
+            match_links = await self.get_all_match_links(main_page)
+            await main_page.close()
+
+            # ২. প্রতিটি ম্যাচ পেজ থেকে ভিডিও প্লেয়ার লিংক সংগ্রহ করা
+            for match in match_links:
+                data = await self.scrape_match_player(context, match)
+                self.extracted_data.append(data)
 
             await browser.close()
-            self._save_to_json()
+            self._save_results()
 
-    def _save_to_json(self, filename: str = "advanced_links.json"):
-        """রিপোর্ট জেনারেট করে লোকাল ফাইলে সেভ করা"""
+    def _save_results(self, filename: str = "advanced_links.json"):
         output = {
-            "execution_time": datetime.utcnow().isoformat() + "Z",
-            "total_targets": len(self.target_urls),
-            "results": self.extracted_data
+            "last_updated": datetime.utcnow().isoformat() + "Z",
+            "source": self.base_url,
+            "total_matches_scraped": len(self.extracted_data),
+            "matches": self.extracted_data
         }
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(output, f, indent=2, ensure_ascii=False)
-        logging.info(f"Results successfully exported to {filename}")
-
+        logging.info(f"Successfully saved all player links to {filename}")
 
 if __name__ == "__main__":
-    # ভবিষ্যতে একাধিক লিঙ্ক যুক্ত করতে পারেন
-    TARGETS = [
-        "https://footfytv.pro/watch/2328"
-    ]
-    
-    scraper = AdvancedStreamScraper(target_urls=TARGETS)
-    asyncio.run(scraper.run_pipeline())
+    BASE_URL = "https://footfytv.pro/"
+    scraper = FootfyTVScraper(base_url=BASE_URL)
+    asyncio.run(scraper.run())
