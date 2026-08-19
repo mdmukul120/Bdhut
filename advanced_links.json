@@ -1,12 +1,6 @@
 {
-  "execution_time": "2026-08-19T10:22:14.519865Z",
-  "total_targets": 1,
-  "results": [
-    {
-      "page_url": "https://footfytv.pro/watch/2328",
-      "timestamp": "2026-08-19T10:22:14.491089Z",
-      "total_found": 0,
-      "stream_links": []
-    }
-  ]
+  "last_updated": "2026-08-19T11:56:25.358188Z",
+  "source": "https://footfytv.pro/",
+  "total_matches_scraped": 0,
+  "matches": []
 }
